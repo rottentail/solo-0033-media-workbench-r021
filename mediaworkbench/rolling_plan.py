@@ -40,6 +40,8 @@ def create(conn, asset_id, start_ms, duration_ms, horizontal_fov, zoom,
         raise ValueError('rolling cut exceeds source or gyro coverage')
     trajectory = rolling_geometry.Trajectory(clean)
     # Check every planned frame before saving: no partial or uncovered plan.
+    # Each frame also verifies that every output pixel has a trustworthy,
+    # in-sensor source row for its own row exposure time.
     for frame in range(duration_ms//40):
         rolling_geometry.mapping(trajectory, start_ms+(frame+.5)*40, w, h,
                                  horizontal_fov, zoom, readout_ms, direction)

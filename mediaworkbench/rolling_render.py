@@ -14,9 +14,38 @@ def sample(image, uv):
     x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
     x1, y1 = np.minimum(x0+1, w-1), np.minimum(y0+1, h-1)
     dx, dy = (x-x0)[..., None], (y-y0)[..., None]
+    # Only the four supporting texels are decoded to scene-linear light, then
+    # interpolated: averaging encoded code values would create dark fringes
+    # beside high-contrast grid lines.
     top = stitch_signal.linear(image[y0, x0])*(1-dx)+stitch_signal.linear(image[y0, x1])*dx
     bottom = stitch_signal.linear(image[y1, x0])*(1-dx)+stitch_signal.linear(image[y1, x1])*dx
     return stitch_signal.encoded(top*(1-dy)+bottom*dy)
+
+
+# Bands keep the float working set bounded for long programmes.
+_BAND_ROWS = 24
+
+
+def resample(image, x, y):
+    h, w = image.shape[:2]
+    result = np.empty_like(image)
+    for start in range(0, h, _BAND_ROWS):
+        stop = min(start+_BAND_ROWS, h)
+        result[start:stop] = sample(image, (x[start:stop], y[start:stop]))
+    return result
+
+
+def corrected(image, trajectory, plan, frame):
+    """Global-shutter picture at this frame's original-recording midpoint."""
+    h, w = image.shape[:2]
+    center_ms = plan['start_ms']+(frame+.5)*40
+    if plan['readout_ms'] == 0 and plan['zoom'] == 1:
+        # Every row is exposed at the midpoint and no crop is applied, so the
+        # output is the original frame at its own pixel centres, byte for byte.
+        return image
+    x, y = rolling_geometry.mapping(trajectory, center_ms, w, h, plan['horizontal_fov'],
+        plan['zoom'], plan['readout_ms'], plan['direction'])
+    return resample(image, x, y)
 
 
 def render(conn, identity, destination, at_frame=0, frame_count=None):
@@ -36,16 +65,17 @@ def render(conn, identity, destination, at_frame=0, frame_count=None):
         root = Path(directory)
         spool, raw = root/'source.rgb', root/'corrected.rgb'
         stitch_render.decode(source, p['start_ms'], p['frames'], spool)
+        size = w*h*3
         with spool.open('rb') as handle, raw.open('wb') as out:
-            handle.seek(at_frame*w*h*3)
+            # A preview slice reads the same spooled frames a complete
+            # delivery would use, at the same original-recording times.
+            handle.seek(at_frame*size)
             for frame in range(at_frame, at_frame+frame_count):
-                data = handle.read(w*h*3)
-                if len(data) != w*h*3:
+                data = handle.read(size)
+                if len(data) != size:
                     raise ValueError('truncated rolling source spool')
                 image = np.frombuffer(data, dtype='uint8').reshape(h, w, 3)
-                uv = rolling_geometry.mapping(trajectory, p['start_ms']+(frame-at_frame+.5)*40,
-                    w, h, p['horizontal_fov'], p['zoom'], p['readout_ms'], p['direction'])
-                out.write(sample(image, uv).tobytes())
+                out.write(corrected(image, trajectory, p, frame).tobytes())
         result = root/'corrected.mkv'
         run('ffmpeg', ['-v','error','-y','-threads','1','-filter_threads','1',
             '-f','rawvideo','-pix_fmt','rgb24','-s',f'{w}x{h}','-r','25','-i',str(raw),
